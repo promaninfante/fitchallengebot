@@ -12,6 +12,8 @@ Environment variables:
 """
 
 import os
+import json
+import tempfile
 import logging
 import random
 import calendar
@@ -44,9 +46,17 @@ log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+if creds_json:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
+    tmp.write(creds_json)
+    tmp.flush()
+    creds_path = tmp.name
+else:
+    creds_path = "credentials-google.json"
 
 def get_spreadsheet():
-    creds  = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    creds  = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
