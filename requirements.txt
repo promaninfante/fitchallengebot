@@ -1,5 +1,5 @@
-python-telegram-bot==20.7
+python-telegram-bot==21.10
 gspread==6.0.2
 google-auth==2.27.0
 APScheduler==3.10.4
-flask
+flask==3.0.3
