@@ -13,10 +13,10 @@ Environment variables:
 
 import os
 import json
-import tempfile
-import logging
 import random
+import logging
 import calendar
+import tempfile
 from datetime import datetime, timedelta
 
 import gspread
@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+
 creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 if creds_json:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
@@ -56,7 +57,7 @@ else:
     creds_path = "credentials-google.json"
 
 def get_spreadsheet():
-    creds  = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    creds  = Credentials.from_service_account_file(creds_json, scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
@@ -79,8 +80,106 @@ def summary_tab(sp):
     return tab(sp, "Weekly Summary", ["Name", "Week", "Month", "Sessions", "Carry-in", "Target", "Skip Used", "Plank Owed"])
 
 
+def weekly_tracker_tab(sp):
+    try:
+        return sp.worksheet("Weekly Tracker")
+    except gspread.WorksheetNotFound:
+        return sp.add_worksheet("Weekly Tracker", rows=50, cols=20)
+
+
 def skips_tab(sp):
     return tab(sp, "Skips", ["Name", "Month", "Used"])
+
+
+def week_cell(sessions: int, target: int) -> str:
+    """Return a formatted cell value with emoji based on performance."""
+    if sessions == 0:
+        return "0 ❌"
+    elif sessions < target:
+        return f"{sessions} ⚠️"
+    elif sessions > target:
+        return f"{sessions} 🏅"
+    else:
+        return f"{sessions} ✅"
+
+
+def compute_badge(rows: list, target_per_week: int) -> str:
+    """Compute monthly badge from a person's weekly rows."""
+    if not rows:
+        return ""
+    above3    = sum(1 for r in rows if int(r.get("Sessions", 0)) > SESSIONS_GOAL)
+    planks    = sum(1 for r in rows if str(r.get("Plank Owed", "")).upper() == "TRUE")
+    total     = sum(int(r.get("Sessions", 0)) for r in rows)
+    weeks     = len(rows)
+    if above3 > 0:
+        return "🏅 Iron"
+    elif planks == 0 and all(int(r.get("Sessions", 0)) >= int(r.get("Target", SESSIONS_GOAL)) for r in rows):
+        return "🥈 Silver"
+    elif total >= weeks * SESSIONS_GOAL * 0.7:
+        return "🥉 Bronze"
+    return ""
+
+
+def rebuild_weekly_tracker(sp):
+    """Rebuild the visual pivot tab: one row per person, one column per week."""
+    sess_ws   = sessions_tab(sp)
+    summ_ws   = summary_tab(sp)
+    sk_ws     = skips_tab(sp)
+    tracker   = weekly_tracker_tab(sp)
+
+    today       = datetime.now()
+    month       = today.month
+    all_sess    = sess_ws.get_all_records()
+    all_summ    = summ_ws.get_all_records()
+    all_skips   = sk_ws.get_all_records()
+
+    # Only current month sessions
+    month_sess  = [r for r in all_sess if datetime.strptime(r["Workout Date"], "%Y-%m-%d").month == month]
+    weeks       = sorted({int(r["Week"]) for r in month_sess})
+
+    if not weeks:
+        return
+
+    names = sorted({r["Name"] for r in month_sess})
+
+    # Build headers
+    headers = ["Name"] + [f"Wk {w}" for w in weeks] + ["Total 💪", "Planks 🪵", "Skip ⏭️", "Badge"]
+
+    rows = [headers]
+    for name in names:
+        person_summ = [r for r in all_summ if r["Name"].lower() == name.lower()
+                       and datetime.now().month == month]
+        skip_used   = any(
+            r["Name"].lower() == name.lower() and int(r["Month"]) == month
+            and str(r.get("Used", "")).upper() in ("TRUE", "1", "YES")
+            for r in all_skips
+        )
+        planks = sum(
+            1 for r in all_summ
+            if r["Name"].lower() == name.lower()
+            and str(r.get("Plank Owed", "")).upper() == "TRUE"
+        )
+
+        total   = 0
+        wk_cells = []
+        for w in weeks:
+            w_sessions = [r for r in month_sess if r["Name"].lower() == name.lower() and int(r["Week"]) == w]
+            count      = len(w_sessions)
+            # Find carry-in for this week
+            carry = 0
+            for sr in all_summ:
+                if sr["Name"].lower() == name.lower() and int(sr.get("Week", 0)) == w:
+                    carry = int(sr.get("Carry-in", 0))
+                    break
+            target = SESSIONS_GOAL + carry
+            wk_cells.append(week_cell(count, target))
+            total += count
+
+        badge = compute_badge(person_summ, SESSIONS_GOAL)
+        rows.append([name] + wk_cells + [total, planks, "Yes" if skip_used else "No", badge])
+
+    tracker.clear()
+    tracker.update(rows, value_input_option="RAW")
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +342,7 @@ Do at least 3 workouts per week. Every week.
 /workout yesterday — same, for yesterday
 /skip — use your one monthly lifeline
 /stats — see current week standings
+/weekly — trigger the weekly recap manually
 /plank — confirm you did your punishment plank
 /shame — see who owes a plank 😈
 /monthly — trigger the monthly hall of fame
@@ -279,27 +379,42 @@ Good luck. You'll need it. 💀
 # COMMANDS
 # ---------------------------------------------------------------------------
 
+def upsert_weekly_summary(summ_ws, name: str, week: int, month: int, sessions: int, carry: int):
+    """Write or update the weekly summary row for a person+week."""
+    target  = SESSIONS_GOAL + carry
+    records = summ_ws.get_all_records()
+    for i, r in enumerate(records):
+        if r["Name"].lower() == name.lower() and int(r["Week"]) == week:
+            summ_ws.update_cell(i + 2, 4, sessions)
+            summ_ws.update_cell(i + 2, 6, target)
+            return
+    summ_ws.append_row([name, week, month, sessions, carry, target, "FALSE", "FALSE"])
+
+
 async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name  = update.effective_user.first_name
-    arg   = context.args[0] if context.args else None
     today = datetime.now()
-    date  = resolve_date(arg)
+
+    # If the first arg is a known day alias use it as date,
+    # otherwise treat everything after /workout as a description and log today.
+    first_arg = context.args[0].lower().strip() if context.args else None
+    if first_arg and first_arg in DAY_ALIASES:
+        date = resolve_date(first_arg)
+    else:
+        date = today
 
     if date is None:
-        if arg:
-            await update.message.reply_text(
-                f"❌ {name}, can't backfill across weeks — Sunday is the cutoff. "
-                "You can only log days within the current week.\n"
-                "Try: /workout monday, /workout friday, /workout yesterday"
-            )
-        else:
-            await update.message.reply_text(f"❓ {name}, unrecognised day. Try /workout monday or /workout yesterday.")
+        await update.message.reply_text(
+            f"❌ {name}, can't backfill across weeks — Sunday is the cutoff.\n"
+            "Try: /workout monday, /workout friday, /workout yesterday"
+        )
         return
 
     sp          = get_spreadsheet()
     sess_ws     = sessions_tab(sp)
     summ_ws     = summary_tab(sp)
     week        = week_num(date)
+    month       = date.month
     existing    = sessions_this_week(sess_ws, name, week)
     workout_str = date.strftime("%Y-%m-%d")
     day_name    = date.strftime("%A")
@@ -324,6 +439,12 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     count = len(existing) + 1
+
+    # Update the weekly summary tab live on every workout
+    upsert_weekly_summary(summ_ws, name, week, month, count, carry)
+
+    # Rebuild the visual pivot tracker
+    rebuild_weekly_tracker(sp)
 
     msg = pick(HYPE_BACKFILL, name=name, day=day_name) if is_back else pick(HYPE, name=name)
 
@@ -446,6 +567,10 @@ async def cmd_shame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_guideme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(GUIDEME_TEXT)
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _post_weekly_summary(context.bot)
 
 
 async def cmd_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -643,6 +768,7 @@ def main():
     app.add_handler(CommandHandler("plank",   cmd_plank))
     app.add_handler(CommandHandler("shame",   cmd_shame))
     app.add_handler(CommandHandler("guideme", cmd_guideme))
+    app.add_handler(CommandHandler("weekly",  cmd_weekly))
     app.add_handler(CommandHandler("monthly", cmd_monthly))
 
     scheduler = AsyncIOScheduler(timezone="UTC")
