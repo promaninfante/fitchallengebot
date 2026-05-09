@@ -3,7 +3,7 @@ GymBot — No Excuses Edition
 Telegram group workout tracker with Google Sheets backend.
 
 Dependencies:
-    pip install python-telegram-bot gspread google-auth apscheduler
+    pip install python-telegram-bot gspread google-auth apscheduler flask
 
 Environment variables:
     BOT_TOKEN       — from BotFather
@@ -16,10 +16,11 @@ import json
 import random
 import logging
 import calendar
-import tempfile
 from datetime import datetime, timedelta
+from threading import Thread
 
 import gspread
+from flask import Flask
 from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -41,23 +42,30 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# FLASK KEEP-ALIVE
+# ---------------------------------------------------------------------------
+
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    return "alive"
+
+Thread(target=lambda: flask_app.run(host="0.0.0.0", port=8080), daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # GOOGLE SHEETS
 # ---------------------------------------------------------------------------
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-if creds_json:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
-    tmp.write(creds_json)
-    tmp.flush()
-    creds_path = tmp.name
-else:
-    creds_path = "credentials-google.json"
-
 def get_spreadsheet():
-    creds  = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file("credentials-google.json", scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
@@ -73,7 +81,8 @@ def tab(spreadsheet, name: str, headers: list):
 
 
 def sessions_tab(sp):
-    return tab(sp, "Sessions", ["Name", "Logged On", "Workout Date", "Day", "Week", "Carry-in", "Type"])
+    # NOTE: if the Sessions tab already exists without "Notes", add it manually as column H header
+    return tab(sp, "Sessions", ["Name", "Logged On", "Workout Date", "Day", "Week", "Carry-in", "Type", "Notes"])
 
 
 def summary_tab(sp):
@@ -92,7 +101,6 @@ def skips_tab(sp):
 
 
 def week_cell(sessions: int, target: int) -> str:
-    """Return a formatted cell value with emoji based on performance."""
     if sessions == 0:
         return "0 ❌"
     elif sessions < target:
@@ -104,13 +112,12 @@ def week_cell(sessions: int, target: int) -> str:
 
 
 def compute_badge(rows: list, target_per_week: int) -> str:
-    """Compute monthly badge from a person's weekly rows."""
     if not rows:
         return ""
-    above3    = sum(1 for r in rows if int(r.get("Sessions", 0)) > SESSIONS_GOAL)
-    planks    = sum(1 for r in rows if str(r.get("Plank Owed", "")).upper() == "TRUE")
-    total     = sum(int(r.get("Sessions", 0)) for r in rows)
-    weeks     = len(rows)
+    above3 = sum(1 for r in rows if int(r.get("Sessions", 0)) > SESSIONS_GOAL)
+    planks = sum(1 for r in rows if str(r.get("Plank Owed", "")).upper() == "TRUE")
+    total  = sum(int(r.get("Sessions", 0)) for r in rows)
+    weeks  = len(rows)
     if above3 > 0:
         return "🏅 Iron"
     elif planks == 0 and all(int(r.get("Sessions", 0)) >= int(r.get("Target", SESSIONS_GOAL)) for r in rows):
@@ -122,33 +129,29 @@ def compute_badge(rows: list, target_per_week: int) -> str:
 
 def rebuild_weekly_tracker(sp):
     """Rebuild the visual pivot tab: one row per person, one column per week."""
-    sess_ws   = sessions_tab(sp)
-    summ_ws   = summary_tab(sp)
-    sk_ws     = skips_tab(sp)
-    tracker   = weekly_tracker_tab(sp)
+    sess_ws = sessions_tab(sp)
+    summ_ws = summary_tab(sp)
+    sk_ws   = skips_tab(sp)
+    tracker = weekly_tracker_tab(sp)
 
-    today       = datetime.now()
-    month       = today.month
-    all_sess    = sess_ws.get_all_records()
-    all_summ    = summ_ws.get_all_records()
-    all_skips   = sk_ws.get_all_records()
+    today      = datetime.now()
+    month      = today.month
+    all_sess   = sess_ws.get_all_records()
+    all_summ   = summ_ws.get_all_records()
+    all_skips  = sk_ws.get_all_records()
 
-    # Only current month sessions
-    month_sess  = [r for r in all_sess if datetime.strptime(r["Workout Date"], "%Y-%m-%d").month == month]
-    weeks       = sorted({int(r["Week"]) for r in month_sess})
+    month_sess = [r for r in all_sess if datetime.strptime(r["Workout Date"], "%Y-%m-%d").month == month]
+    weeks      = sorted({int(r["Week"]) for r in month_sess})
 
     if not weeks:
         return
 
-    names = sorted({r["Name"] for r in month_sess})
-
-    # Build headers
+    names   = sorted({r["Name"] for r in month_sess})
     headers = ["Name"] + [f"Wk {w}" for w in weeks] + ["Total 💪", "Planks 🪵", "Skip ⏭️", "Badge"]
+    rows    = [headers]
 
-    rows = [headers]
     for name in names:
-        person_summ = [r for r in all_summ if r["Name"].lower() == name.lower()
-                       and datetime.now().month == month]
+        person_summ = [r for r in all_summ if r["Name"].lower() == name.lower() and int(r.get("Month", 0)) == month]
         skip_used   = any(
             r["Name"].lower() == name.lower() and int(r["Month"]) == month
             and str(r.get("Used", "")).upper() in ("TRUE", "1", "YES")
@@ -160,19 +163,14 @@ def rebuild_weekly_tracker(sp):
             and str(r.get("Plank Owed", "")).upper() == "TRUE"
         )
 
-        total   = 0
+        total    = 0
         wk_cells = []
         for w in weeks:
             w_sessions = [r for r in month_sess if r["Name"].lower() == name.lower() and int(r["Week"]) == w]
             count      = len(w_sessions)
-            # Find carry-in for this week
-            carry = 0
-            for sr in all_summ:
-                if sr["Name"].lower() == name.lower() and int(sr.get("Week", 0)) == w:
-                    carry = int(sr.get("Carry-in", 0))
-                    break
-            target = SESSIONS_GOAL + carry
-            wk_cells.append(week_cell(count, target))
+            carry      = next((int(sr.get("Carry-in", 0)) for sr in all_summ
+                               if sr["Name"].lower() == name.lower() and int(sr.get("Week", 0)) == w), 0)
+            wk_cells.append(week_cell(count, SESSIONS_GOAL + carry))
             total += count
 
         badge = compute_badge(person_summ, SESSIONS_GOAL)
@@ -204,10 +202,6 @@ def week_num(date: datetime) -> int:
 
 
 def resolve_date(arg: str | None) -> datetime | None:
-    """
-    Resolve /workout [arg] to an actual date.
-    Returns None if the resolved date is in a different week (cross-week backfill blocked).
-    """
     today = datetime.now()
     if not arg:
         return today
@@ -224,9 +218,8 @@ def resolve_date(arg: str | None) -> datetime | None:
         days_back  = (current_wd - target_wd) % 7
         candidate  = today if days_back == 0 else today - timedelta(days=days_back)
     else:
-        return None  # unrecognised arg
+        return None
 
-    # Block cross-week backfill
     if week_num(candidate) != week_num(today):
         return None
 
@@ -267,7 +260,7 @@ def mark_plank_cleared(summary_ws, name: str, week: int):
     records = summary_ws.get_all_records()
     for i, r in enumerate(records):
         if r["Name"].lower() == name.lower() and int(r["Week"]) == week:
-            summary_ws.update_cell(i + 2, 8, "FALSE")  # col 8 = Plank Owed
+            summary_ws.update_cell(i + 2, 8, "FALSE")
             return
 
 
@@ -307,8 +300,7 @@ DONE_WEEK = [
 ]
 
 ABOVE_TARGET = "\n\n🏅 {count}/{target} — ABOVE the minimum. Iron energy."
-
-PROGRESS = "\n\n📊 {count}/{target} this week. {left} more to go."
+PROGRESS     = "\n\n📊 {count}/{target} this week. {left} more to go."
 
 SKIP_MSG = [
     "⏭️ {name} burns the monthly lifeline. +1 session moves to next week. Use it wisely.",
@@ -323,8 +315,7 @@ PLANK_CONFIRMED = [
 ]
 
 WEEKLY_RECAP_HEADER = "📊 Week {week} recap — {date}\n"
-
-MONTHLY_FOOTER = "\nSee you next month. No mercy. 💀"
+MONTHLY_FOOTER      = "\nSee you next month. No mercy. 💀"
 
 GUIDEME_TEXT = """
 👋 Welcome to GymBot — No Excuses Edition!
@@ -338,8 +329,9 @@ Do at least 3 workouts per week. Every week.
 📋 COMMANDS
 ━━━━━━━━━━━━━━━━━━━━
 /workout — log today's session
-/workout monday — backfill a day from this week
-/workout yesterday — same, for yesterday
+/workout legs day 🦵 — log today with a description
+/workout monday ran 5k — backfill a day with a note
+/workout yesterday — backfill yesterday
 /skip — use your one monthly lifeline
 /stats — see current week standings
 /weekly — trigger the weekly recap manually
@@ -367,7 +359,7 @@ Do at least 3 workouts per week. Every week.
 🏅 MONTHLY BADGES
 ━━━━━━━━━━━━━━━━━━━━
 🏅 Iron — went above 3 in at least one week
-🥈 Silver — hit exactly 3/3 every week
+🥈 Silver — hit exactly 3/3 every week, zero planks
 🥉 Bronze — showed up most weeks
 🪵 Plank King — most planks (not a compliment)
 📈 Glow Up — most improved vs last month
@@ -380,7 +372,6 @@ Good luck. You'll need it. 💀
 # ---------------------------------------------------------------------------
 
 def upsert_weekly_summary(summ_ws, name: str, week: int, month: int, sessions: int, carry: int):
-    """Write or update the weekly summary row for a person+week."""
     target  = SESSIONS_GOAL + carry
     records = summ_ws.get_all_records()
     for i, r in enumerate(records):
@@ -395,13 +386,15 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name  = update.effective_user.first_name
     today = datetime.now()
 
-    # If the first arg is a known day alias use it as date,
-    # otherwise treat everything after /workout as a description and log today.
+    # If the first arg is a known day alias, use it as the date and the rest as a note.
+    # Otherwise log for today and treat all args as the note.
     first_arg = context.args[0].lower().strip() if context.args else None
     if first_arg and first_arg in DAY_ALIASES:
-        date = resolve_date(first_arg)
+        date  = resolve_date(first_arg)
+        notes = " ".join(context.args[1:]) if len(context.args) > 1 else ""
     else:
-        date = today
+        date  = today
+        notes = " ".join(context.args) if context.args else ""
 
     if date is None:
         await update.message.reply_text(
@@ -419,7 +412,6 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     workout_str = date.strftime("%Y-%m-%d")
     day_name    = date.strftime("%A")
 
-    # Duplicate guard
     if any(r["Workout Date"] == workout_str for r in existing):
         await update.message.reply_text(f"🤔 {name}, already logged a session for {day_name}. One per day!")
         return
@@ -436,23 +428,17 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         week,
         carry,
         "backfill" if is_back else "workout",
+        notes,
     ])
 
     count = len(existing) + 1
-
-    # Update the weekly summary tab live on every workout
     upsert_weekly_summary(summ_ws, name, week, month, count, carry)
-
-    # Rebuild the visual pivot tracker
     rebuild_weekly_tracker(sp)
 
     msg = pick(HYPE_BACKFILL, name=name, day=day_name) if is_back else pick(HYPE, name=name)
 
     if count >= target:
-        if count > target:
-            msg += ABOVE_TARGET.format(count=count, target=target)
-        else:
-            msg += pick(DONE_WEEK, count=count, target=target)
+        msg += ABOVE_TARGET.format(count=count, target=target) if count > target else pick(DONE_WEEK, count=count, target=target)
     else:
         msg += PROGRESS.format(count=count, target=target, left=target - count)
 
@@ -475,7 +461,6 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mark_skip(sk_ws, name, month)
 
-    # Register carry-in for next week
     summ_ws   = summary_tab(sp)
     next_week = week_num(today) + 1
     rows      = summ_ws.get_all_records()
@@ -510,18 +495,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📊 Week {week} — current standings\n"]
     for name in names:
-        count  = len([r for r in week_sessions if r["Name"].lower() == name.lower()])
-        carry  = carry_in_for(summ_ws, name, week)
-        target = SESSIONS_GOAL + carry
+        count     = len([r for r in week_sessions if r["Name"].lower() == name.lower()])
+        carry     = carry_in_for(summ_ws, name, week)
+        target    = SESSIONS_GOAL + carry
         carry_str = f" (+{carry} carry-in)" if carry else ""
-
-        if count >= target:
-            icon = "🏅" if count > target else "✅"
-        elif count > 0:
-            icon = "⚠️"
-        else:
-            icon = "❌"
-
+        icon      = "🏅" if count > target else "✅" if count >= target else "⚠️" if count > 0 else "❌"
         lines.append(f"{icon} {name}: {count}/{target}{carry_str}")
 
     await update.message.reply_text("\n".join(lines))
@@ -534,8 +512,7 @@ async def cmd_plank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
 
-    rows = summ_ws.get_all_records()
-    for i, r in enumerate(rows):
+    for i, r in enumerate(summ_ws.get_all_records()):
         if r["Name"].lower() == name.lower() and int(r["Week"]) == week:
             if str(r.get("Plank Owed", "")).lower() == "true":
                 mark_plank_cleared(summ_ws, name, week)
@@ -558,9 +535,8 @@ async def cmd_shame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Nobody owes a plank right now. Suspiciously wholesome.")
         return
 
-    names_str = ", ".join(owing)
     await update.message.reply_text(
-        f"🪵 PLANK DEBTORS this week:\n\n{names_str}\n\n"
+        f"🪵 PLANK DEBTORS this week:\n\n{', '.join(owing)}\n\n"
         "Post your 1-minute video and use /plank to clear it. The group is watching. 👀"
     )
 
@@ -569,19 +545,14 @@ async def cmd_guideme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(GUIDEME_TEXT)
 
 
-async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _post_weekly_summary(context.bot)
-
-
-async def cmd_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _post_monthly_review(context.bot)
-
-
 # ---------------------------------------------------------------------------
-# SCHEDULED JOBS
+# BUILD HELPERS — return text only, no sending
+# Commands use reply_text (scoped to one message, never duplicated).
+# Scheduler uses bot.send_message to broadcast.
+# Keeping these separate is what prevents the double-message bug.
 # ---------------------------------------------------------------------------
 
-async def _post_weekly_summary(bot):
+async def _build_weekly_summary() -> str | None:
     today   = datetime.now()
     week    = week_num(today)
     sp      = get_spreadsheet()
@@ -595,38 +566,34 @@ async def _post_weekly_summary(bot):
     names         = sorted({r["Name"] for r in week_sessions})
 
     if not names:
-        return
+        return None
 
-    lines         = [WEEKLY_RECAP_HEADER.format(week=week, date=today.strftime("%b %d"))]
-    planks_owed   = []
-    skips_used    = []
+    lines          = [WEEKLY_RECAP_HEADER.format(week=week, date=today.strftime("%b %d"))]
+    planks_owed    = []
     all_skips_info = []
 
     for name in names:
-        count  = len([r for r in week_sessions if r["Name"].lower() == name.lower()])
-        carry  = carry_in_for(summ_ws, name, week)
-        target = SESSIONS_GOAL + carry
+        count     = len([r for r in week_sessions if r["Name"].lower() == name.lower()])
+        carry     = carry_in_for(summ_ws, name, week)
+        target    = SESSIONS_GOAL + carry
         used_skip = skip_used_this_month(sk_ws, name, month)
         carry_str = f" (+{carry} carry)" if carry else ""
 
         if count >= target:
-            extra = count - target
-            badge = " 🏅" if extra > 0 else ""
+            badge = " 🏅" if count > target else ""
             lines.append(f"✅ {name}: {count}/{target}{carry_str}{badge}")
-            plank = False
+            plank     = False
             skip_flag = False
         elif used_skip:
             lines.append(f"⏭️ {name}: {count}/{target}{carry_str} (skip used — +1 next week)")
-            skips_used.append(name)
-            plank = False
+            plank     = False
             skip_flag = True
         else:
             lines.append(f"❌ {name}: {count}/{target}{carry_str} — PLANK TIME 🪵")
             planks_owed.append(name)
-            plank = True
+            plank     = True
             skip_flag = False
 
-        # Write to summary tab
         summ_ws.append_row([name, week, month, count, carry, target, str(skip_flag).upper(), str(plank).upper()])
         all_skips_info.append(f"{name} {'0' if used_skip else '1'}")
 
@@ -635,46 +602,24 @@ async def _post_weekly_summary(bot):
         lines.append("1 min plank. Post a video. Then use /plank to clear it.")
 
     lines.append(f"\nSkips left this month: {' · '.join(all_skips_info)}")
-
-    await bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
-
-
-async def _post_plank_reminder(bot):
-    today   = datetime.now()
-    week    = week_num(today)
-    sp      = get_spreadsheet()
-    summ_ws = summary_tab(sp)
-    owing   = planks_owed_this_week(summ_ws, week)
-
-    if not owing:
-        return
-
-    names_str = ", ".join(owing)
-    await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=(
-            f"🪵 Good morning! Plank reminder for: {names_str}\n\n"
-            "Post your 1-minute video and use /plank to clear the debt. "
-            "Don't make us ask again. 😤"
-        ),
-    )
+    return "\n".join(lines)
 
 
-async def _post_monthly_review(bot):
+async def _build_monthly_review() -> str | None:
     today   = datetime.now()
     month   = today.month
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
     sk_ws   = skips_tab(sp)
 
-    all_rows    = summ_ws.get_all_records()
-    month_rows  = [r for r in all_rows if int(r.get("Month", 0)) == month]
+    all_rows   = summ_ws.get_all_records()
+    month_rows = [r for r in all_rows if int(r.get("Month", 0)) == month]
 
     if not month_rows:
-        return
+        return None
 
-    names  = sorted({r["Name"] for r in month_rows})
-    stats  = {}
+    names = sorted({r["Name"] for r in month_rows})
+    stats = {}
 
     for name in names:
         rows     = [r for r in month_rows if r["Name"].lower() == name.lower()]
@@ -689,14 +634,8 @@ async def _post_monthly_review(bot):
 
     lines = [f"🏆 {month_name} RECAP — THE COUNCIL OF GAINS 🏆\n"]
     for name in sorted_names:
-        s     = stats[name]
-        badge = ""
-        if s["above3"] > 0:
-            badge = " 🏅 Iron"
-        elif s["planks"] == 0 and s["sessions"] >= s["target"]:
-            badge = " 🥈 Silver"
-        elif s["sessions"] >= s["target"] * 0.7:
-            badge = " 🥉 Bronze"
+        s         = stats[name]
+        badge     = " 🏅 Iron" if s["above3"] > 0 else " 🥈 Silver" if s["planks"] == 0 and s["sessions"] >= s["target"] else " 🥉 Bronze" if s["sessions"] >= s["target"] * 0.7 else ""
         skip_used = skip_used_this_month(sk_ws, name, month)
         skip_str  = " · skip used" if skip_used else ""
         lines.append(f"{name}: {s['sessions']}/{s['target']} sessions · {s['planks']} planks{skip_str}{badge}")
@@ -706,16 +645,61 @@ async def _post_monthly_review(bot):
     lines.append(f"\n🥇 Most sessions: {best}")
     if stats[plank_kng]["planks"] > 0:
         lines.append(f"🪵 Plank King: {plank_kng} ({stats[plank_kng]['planks']} planks)")
-
-    # Most improved: needs last month data — skip if not available
     lines.append(MONTHLY_FOOTER)
 
-    await bot.send_message(chat_id=GROUP_CHAT_ID, text="\n".join(lines))
-
-    # Reset skip records for the new month
+    # Reset skips for the new month
     sk_ws.clear()
     sk_ws.append_row(["Name", "Month", "Used"])
     log.info("Skips reset for new month.")
+
+    return "\n".join(lines)
+
+
+# Commands — reply_text is scoped to the message, never sent twice
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _build_weekly_summary()
+    await update.message.reply_text(text or "📊 No sessions logged this week yet.")
+
+
+async def cmd_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _build_monthly_review()
+    await update.message.reply_text(text or "🏆 No data for this month yet.")
+
+
+# ---------------------------------------------------------------------------
+# SCHEDULED JOBS — broadcast to group via bot.send_message
+# ---------------------------------------------------------------------------
+
+async def _post_weekly_summary(bot):
+    text = await _build_weekly_summary()
+    if text:
+        await bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
+
+
+async def _post_plank_reminder(bot):
+    today   = datetime.now()
+    week    = week_num(today)
+    sp      = get_spreadsheet()
+    summ_ws = summary_tab(sp)
+    owing   = planks_owed_this_week(summ_ws, week)
+
+    if not owing:
+        return
+
+    await bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=(
+            f"🪵 Good morning! Plank reminder for: {', '.join(owing)}\n\n"
+            "Post your 1-minute video and use /plank to clear the debt. "
+            "Don't make us ask again. 😤"
+        ),
+    )
+
+
+async def _post_monthly_review(bot):
+    text = await _build_monthly_review()
+    if text:
+        await bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
 
 
 def is_last_day_of_month() -> bool:
@@ -724,7 +708,6 @@ def is_last_day_of_month() -> bool:
     return today.day == last_day
 
 
-# Scheduler wrapper functions (APScheduler needs plain callables)
 async def job_sunday_recap(bot):
     log.info("Running Sunday weekly recap")
     await _post_weekly_summary(bot)
@@ -740,20 +723,6 @@ async def job_month_end(bot):
         log.info("Running month-end review")
         await _post_monthly_review(bot)
 
-# Adding flask endpoint
-from flask import Flask
-from threading import Thread
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "alive"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-Thread(target=run_web).start()
 
 # ---------------------------------------------------------------------------
 # MAIN
@@ -774,16 +743,13 @@ def main():
     scheduler = AsyncIOScheduler(timezone="UTC")
     bot       = app.bot
 
-    # Sunday 9pm UTC
-    scheduler.add_job(job_sunday_recap,   "cron", day_of_week="sun", hour=21, minute=0,  args=[bot])
-    # Monday 9am UTC
-    scheduler.add_job(job_monday_reminder,"cron", day_of_week="mon", hour=9,  minute=0,  args=[bot])
-    # Every day at 9pm — checks if it's the last day of the month
-    scheduler.add_job(job_month_end,      "cron",                    hour=21, minute=30, args=[bot])
+    scheduler.add_job(job_sunday_recap,    "cron", day_of_week="sun", hour=21, minute=0,  args=[bot])
+    scheduler.add_job(job_monday_reminder, "cron", day_of_week="mon", hour=9,  minute=0,  args=[bot])
+    scheduler.add_job(job_month_end,       "cron",                    hour=21, minute=30, args=[bot])
 
     scheduler.start()
     log.info("GymBot started. Let the suffering begin.")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
