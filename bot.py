@@ -605,6 +605,20 @@ async def job_month_end(bot):
         log.info("Running month-end review")
         await _post_monthly_review(bot)
 
+# Adding flask endpoint
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "alive"
+
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
+
+Thread(target=run_web).start()
 
 # ---------------------------------------------------------------------------
 # MAIN
