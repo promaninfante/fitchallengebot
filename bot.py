@@ -57,7 +57,7 @@ else:
     creds_path = "credentials-google.json"
 
 def get_spreadsheet():
-    creds  = Credentials.from_service_account_file(creds_json, scopes=SCOPES)
+    creds  = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
