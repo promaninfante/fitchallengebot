@@ -17,6 +17,7 @@ import random
 import logging
 import calendar
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from threading import Thread
 
 import gspread
@@ -34,6 +35,7 @@ BOT_TOKEN     = os.environ["BOT_TOKEN"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 SHEET_ID      = os.environ["SHEET_ID"]
 SESSIONS_GOAL = 3  # mandatory sessions per week
+TZ            = ZoneInfo("America/New_York")
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -51,7 +53,8 @@ flask_app = Flask(__name__)
 def home():
     return "alive"
 
-Thread(target=lambda: flask_app.run(host="0.0.0.0", port=8080), daemon=True).start()
+_PORT = int(os.environ.get("PORT", 8080))
+Thread(target=lambda: flask_app.run(host="0.0.0.0", port=_PORT), daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # GOOGLE SHEETS
@@ -134,7 +137,7 @@ def rebuild_weekly_tracker(sp):
     sk_ws   = skips_tab(sp)
     tracker = weekly_tracker_tab(sp)
 
-    today      = datetime.now()
+    today      = datetime.now(TZ)
     month      = today.month
     all_sess   = sess_ws.get_all_records()
     all_summ   = summ_ws.get_all_records()
@@ -202,7 +205,7 @@ def week_num(date: datetime) -> int:
 
 
 def resolve_date(arg: str | None) -> datetime | None:
-    today = datetime.now()
+    today = datetime.now(TZ)
     if not arg:
         return today
 
@@ -384,7 +387,7 @@ def upsert_weekly_summary(summ_ws, name: str, week: int, month: int, sessions: i
 
 async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name  = update.effective_user.first_name
-    today = datetime.now()
+    today = datetime.now(TZ)
 
     # If the first arg is a known day alias, use it as the date and the rest as a note.
     # Otherwise log for today and treat all args as the note.
@@ -447,7 +450,7 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name  = update.effective_user.first_name
-    today = datetime.now()
+    today = datetime.now(TZ)
     month = today.month
     sp    = get_spreadsheet()
     sk_ws = skips_tab(sp)
@@ -479,7 +482,7 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     week    = week_num(today)
     sp      = get_spreadsheet()
     sess_ws = sessions_tab(sp)
@@ -507,7 +510,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_plank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name    = update.effective_user.first_name
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     week    = week_num(today)
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
@@ -525,7 +528,7 @@ async def cmd_plank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_shame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     week    = week_num(today)
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
@@ -553,7 +556,7 @@ async def cmd_guideme(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def _build_weekly_summary() -> str | None:
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     week    = week_num(today)
     sp      = get_spreadsheet()
     sess_ws = sessions_tab(sp)
@@ -606,7 +609,7 @@ async def _build_weekly_summary() -> str | None:
 
 
 async def _build_monthly_review() -> str | None:
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     month   = today.month
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
@@ -677,7 +680,7 @@ async def _post_weekly_summary(bot):
 
 
 async def _post_plank_reminder(bot):
-    today   = datetime.now()
+    today   = datetime.now(TZ)
     week    = week_num(today)
     sp      = get_spreadsheet()
     summ_ws = summary_tab(sp)
@@ -703,7 +706,7 @@ async def _post_monthly_review(bot):
 
 
 def is_last_day_of_month() -> bool:
-    today    = datetime.now()
+    today    = datetime.now(TZ)
     last_day = calendar.monthrange(today.year, today.month)[1]
     return today.day == last_day
 
@@ -740,7 +743,7 @@ def main():
     app.add_handler(CommandHandler("weekly",  cmd_weekly))
     app.add_handler(CommandHandler("monthly", cmd_monthly))
 
-    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler = AsyncIOScheduler(timezone="America/New_York")
     bot       = app.bot
 
     scheduler.add_job(job_sunday_recap,    "cron", day_of_week="sun", hour=21, minute=0,  args=[bot])
