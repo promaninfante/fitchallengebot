@@ -751,6 +751,8 @@ def main():
     scheduler.add_job(job_month_end,       "cron",                    hour=21, minute=30, args=[bot])
 
     scheduler.start()
+    for job in scheduler.get_jobs():
+        log.info(f"{job.id} next run: {job.next_run_time}")
     log.info("GymBot started. Let the suffering begin.")
     app.run_polling(drop_pending_updates=True)
 
