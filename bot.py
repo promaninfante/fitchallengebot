@@ -746,9 +746,9 @@ def main():
     scheduler = AsyncIOScheduler(timezone="America/New_York")
     bot       = app.bot
 
-    scheduler.add_job(job_sunday_recap,    "cron", day_of_week="sun", hour=21, minute=0,  args=[bot])
+    scheduler.add_job(job_sunday_recap,    "cron", day_of_week="sun", hour=23, minute=59, args=[bot])
     scheduler.add_job(job_monday_reminder, "cron", day_of_week="mon", hour=9,  minute=0,  args=[bot])
-    scheduler.add_job(job_month_end,       "cron",                    hour=21, minute=30, args=[bot])
+    scheduler.add_job(job_month_end,       "cron",                    hour=23, minute=59, args=[bot])
 
     scheduler.start()
     for job in scheduler.get_jobs():
